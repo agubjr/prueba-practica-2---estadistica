@@ -77,6 +77,18 @@ calculate_metrics <- function(cm) {
     Precision = Precision, F1_Score = F1_Score, TP = TP, TN = TN, FP = FP, FN = FN)
 }
 
+# --- BLOQUE A: F1 dado un eps ---
+compute_f1_for_epsilon <- function(eps, log_diff, y_test) {
+  preds <- factor(ifelse(log_diff > eps, "pos", "neg"), levels = c("neg", "pos"))
+  cm <- table(Predicted = preds, Actual = y_test)
+  mets <- calculate_metrics(cm)
+  as.numeric(mets["F1_Score"])
+}
+
+
+
+
+
 # Pipeline completo para una semilla: división, cálculo parámetros, predicción y evaluación
 run_pipeline_with_seed <- function(sd) {
   split <- stratified_split(df, "diabetes", train_prop = 0.8, seed = sd)
@@ -235,6 +247,7 @@ clusterEvalQ(cl, {
   library(dplyr)
   library(pROC)
 })
+
 
 start_time <- Sys.time()
 res_all <- parLapply(cl, seed_set, run_pipeline_with_seed) %>% bind_rows()
@@ -401,121 +414,92 @@ cat("✓ Cálculo completado.\n")
 cat(sprintf("  Rango de log(P(pos|X)) - log(P(neg|X)): [%.3f, %.3f]\n", min(log_diff), max(log_diff)))
 
 #===============================================================================
-# 6. Evaluación con múltiples umbrales ε
+# 6. BÚSQUEDA BINARIA DEL UMBRAL ÓPTIMO ε*
 #===============================================================================
-print_section("6. EVALUACIÓN DE MÉTRICAS CON DIFERENTES UMBRALES")
 
-print_subsection("Barrido de Umbrales ε ∈ [-3, 3]")
+print_section("6. BÚSQUEDA BINARIA DEL UMBRAL ÓPTIMO (ε*)")
 
-epsilon_values <- seq(-3, 3, length.out = 100)
-cat(sprintf("Número de umbrales evaluados: %d\n", length(epsilon_values)))
-cat(sprintf("Rango: [%.3f, %.3f]\n", min(epsilon_values), max(epsilon_values)))
-
-cat("Evaluando métricas para cada umbral...\n")
-
-results <- data.frame(
-  epsilon = epsilon_values,
-  Accuracy = NA,
-  Sensitivity = NA,
-  Specificity = NA,
-  Precision = NA,
-  F1_Score = NA,
-  TP = NA, TN = NA, FP = NA, FN = NA
-)
-
-for (k in 1:length(epsilon_values)) {
-  eps <- epsilon_values[k]
-  predictions <- ifelse(log_diff > eps, "pos", "neg")
-  predictions <- factor(predictions, levels = c("neg", "pos"))
-  cm <- table(Predicted = predictions, Actual = y_test)
-  metrics <- calculate_metrics(cm)
-  results[k, 2:10] <- metrics
+# --- Función para calcular F1 dado un umbral ε ---
+compute_f1_for_epsilon <- function(eps, log_diff, y_test) {
+  preds <- factor(ifelse(log_diff > eps, "pos", "neg"), levels = c("neg", "pos"))
+  cm <- table(Predicted = preds, Actual = y_test)
+  mets <- calculate_metrics(cm)
+  as.numeric(mets["F1_Score"])
 }
 
-cat("✓ Evaluación completada.\n")
+# --- Función de búsqueda binaria para maximizar F1 ---
+binary_search_f1 <- function(log_diff, y_test, lower = -3, upper = 3,
+                             tol = 1e-3, max_iter = 25) {
+  iter <- 0
+  repeat {
+    iter <- iter + 1
+    mid <- (lower + upper) / 2
+    delta <- (upper - lower) / 5 # paso lateral
+    
+    if (delta < tol || iter > max_iter) break
+    
+    f1_left  <- compute_f1_for_epsilon(mid - delta, log_diff, y_test)
+    f1_mid   <- compute_f1_for_epsilon(mid, log_diff, y_test)
+    f1_right <- compute_f1_for_epsilon(mid + delta, log_diff, y_test)
+    
+    cat(sprintf("Iter %02d | ε ∈ [%.4f, %.4f] | F1_left=%.4f F1_mid=%.4f F1_right=%.4f\n",
+                iter, lower, upper, f1_left, f1_mid, f1_right))
+    
+    if (f1_left > f1_mid) {
+      upper <- mid
+    } else if (f1_right > f1_mid) {
+      lower <- mid
+    } else {
+      # máximo local encontrado
+      lower <- mid - delta/2
+      upper <- mid + delta/2
+    }
+  }
+  
+  eps_star <- (lower + upper) / 2
+  best_f1  <- compute_f1_for_epsilon(eps_star, log_diff, y_test)
+  list(epsilon_opt = eps_star, best_f1 = best_f1, iterations = iter)
+}
+
+# --- Ejecutar la búsqueda binaria ---
+cat("Buscando umbral óptimo (ε*) con búsqueda binaria...\n")
+bs_res <- binary_search_f1(log_diff, y_test, lower = -3, upper = 3, tol = 1e-3, max_iter = 25)
+epsilon_optimal <- bs_res$epsilon_opt
+best_F1 <- bs_res$best_f1
+cat(sprintf("✓ ε* = %.4f | F1 = %.4f | iteraciones = %d\n",
+            epsilon_optimal, best_F1, bs_res$iterations))
 
 #===============================================================================
-# 7. Identificación del umbral óptimo
+# 7. EVALUACIÓN FINAL EN EL UMBRAL ÓPTIMO
 #===============================================================================
 
-print_section("7. SELECCIÓN DEL UMBRAL ÓPTIMO")
+print_section("7. EVALUACIÓN FINAL EN EL UMBRAL ÓPTIMO (ε*)")
 
-print_subsection("Criterio: Maximización del F1-Score")
-
-best_idx <- which.max(results$F1_Score)
-epsilon_optimal <- results$epsilon[best_idx]
-best_F1 <- results$F1_Score[best_idx]
-best_Accuracy <- results$Accuracy[best_idx]
-best_Sensitivity <- results$Sensitivity[best_idx]
-best_Specificity <- results$Specificity[best_idx]
-best_Precision <- results$Precision[best_idx]
-
-cat(sprintf("Umbral óptimo (ε*): %.6f\n", epsilon_optimal))
-cat(sprintf("F1-Score máximo: %.6f\n\n", best_F1))
-
-print_subsection("Métricas en el Umbral Óptimo (ε*)")
-cat(sprintf("  Accuracy:    %.4f (%.2f%%)\n", best_Accuracy, best_Accuracy * 100))
-cat(sprintf("  Sensitivity: %.4f (%.2f%%)\n", best_Sensitivity, best_Sensitivity * 100))
-cat(sprintf("  Specificity: %.4f (%.2f%%)\n", best_Specificity, best_Specificity * 100))
-cat(sprintf("  Precision:   %.4f (%.2f%%)\n", best_Precision, best_Precision * 100))
-cat(sprintf("  F1-Score:    %.4f\n", best_F1))
-
-print_subsection("Matriz de Confusión en ε*")
-pred_optimal <- ifelse(log_diff > epsilon_optimal, "pos", "neg")
-pred_optimal <- factor(pred_optimal, levels = c("neg", "pos"))
+# Calcular matriz de confusión en ε*
+pred_optimal <- factor(ifelse(log_diff > epsilon_optimal, "pos", "neg"), levels = c("neg", "pos"))
 cm_optimal <- table(Predicted = pred_optimal, Actual = y_test)
+
+# Calcular métricas completas
+metrics_optimal <- calculate_metrics(cm_optimal)
+
+cat("\nMatriz de Confusión en ε*:\n")
 print(cm_optimal)
 
+cat("\nMétricas en el umbral óptimo:\n")
+cat(sprintf("  Accuracy:    %.4f (%.2f%%)\n", metrics_optimal["Accuracy"], metrics_optimal["Accuracy"] * 100))
+cat(sprintf("  Sensitivity: %.4f (%.2f%%)\n", metrics_optimal["Sensitivity"], metrics_optimal["Sensitivity"] * 100))
+cat(sprintf("  Specificity: %.4f (%.2f%%)\n", metrics_optimal["Specificity"], metrics_optimal["Specificity"] * 100))
+cat(sprintf("  Precision:   %.4f (%.2f%%)\n", metrics_optimal["Precision"], metrics_optimal["Precision"] * 100))
+cat(sprintf("  F1-Score:    %.4f\n", metrics_optimal["F1_Score"]))
+
 cat("\nInterpretación:\n")
-cat(sprintf("  Verdaderos Positivos (TP): %d\n", results$TP[best_idx]))
-cat(sprintf("  Verdaderos Negativos (TN): %d\n", results$TN[best_idx]))
-cat(sprintf("  Falsos Positivos (FP): %d\n", results$FP[best_idx]))
-cat(sprintf("  Falsos Negativos (FN): %d\n", results$FN[best_idx]))
+cat(sprintf("  TP (Verdaderos Positivos): %d\n", metrics_optimal["TP"]))
+cat(sprintf("  TN (Verdaderos Negativos): %d\n", metrics_optimal["TN"]))
+cat(sprintf("  FP (Falsos Positivos):     %d\n", metrics_optimal["FP"]))
+cat(sprintf("  FN (Falsos Negativos):     %d\n", metrics_optimal["FN"]))
+cat(sprintf("\n✓ Umbral óptimo encontrado con búsqueda binaria: ε* = %.4f (F1 = %.4f)\n",
+            epsilon_optimal, best_F1))
 
-print_subsection("Comparación con Umbral Neutro (ε = 0)")
-idx_zero <- which.min(abs(results$epsilon))
-eps_zero <- results$epsilon[idx_zero]
-
-cat(sprintf("Umbral neutro ε ≈ %.6f:\n", eps_zero))
-cat(sprintf("  Accuracy:    %.4f (%.2f%%)\n", results$Accuracy[idx_zero], results$Accuracy[idx_zero] * 100))
-cat(sprintf("  Sensitivity: %.4f (%.2f%%)\n", results$Sensitivity[idx_zero], results$Sensitivity[idx_zero] * 100))
-cat(sprintf("  Specificity: %.4f (%.2f%%)\n", results$Specificity[idx_zero], results$Specificity[idx_zero] * 100))
-cat(sprintf("  F1-Score:    %.4f\n\n", results$F1_Score[idx_zero]))
-
-cat("Mejora al usar ε* vs ε=0:\n")
-cat(sprintf("  ΔF1-Score:    %+.4f (%.2f%%)\n", 
-            best_F1 - results$F1_Score[idx_zero],
-            100 * (best_F1 - results$F1_Score[idx_zero]) / results$F1_Score[idx_zero]))
-cat(sprintf("  ΔSensitivity: %+.4f\n", best_Sensitivity - results$Sensitivity[idx_zero]))
-cat(sprintf("  ΔSpecificity: %+.4f\n", best_Specificity - results$Specificity[idx_zero]))
-
-print_subsection("Tabla Comparativa: Umbrales Clave")
-
-key_epsilons <- c(-1, 0, epsilon_optimal, 1)
-comparison_table <- data.frame(
-  Umbral = character(),
-  Epsilon = numeric(),
-  Accuracy = numeric(),
-  Sensitivity = numeric(),
-  Specificity = numeric(),
-  F1_Score = numeric()
-)
-
-for (eps_val in key_epsilons) {
-  idx <- which.min(abs(results$epsilon - eps_val))
-  label <- if (abs(results$epsilon[idx] - epsilon_optimal) < 0.001) "ε* (óptimo)" else sprintf("ε = %.1f", eps_val)
-  
-  comparison_table <- rbind(comparison_table, data.frame(
-    Umbral = label,
-    Epsilon = results$epsilon[idx],
-    Accuracy = results$Accuracy[idx],
-    Sensitivity = results$Sensitivity[idx],
-    Specificity = results$Specificity[idx],
-    F1_Score = results$F1_Score[idx]
-  ))
-}
-
-print(comparison_table)
 
 #===============================================================================
 # 8. Visualizaciones
@@ -524,6 +508,23 @@ print(comparison_table)
 print_section("8. VISUALIZACIONES")
 
 print_subsection("Generando gráficos...")
+# Generar resultados de métricas solo para graficar
+epsilon_values <- seq(-3, 3, length.out = 60)
+results <- data.frame(
+  epsilon = epsilon_values,
+  Accuracy = NA,
+  Sensitivity = NA,
+  Specificity = NA,
+  F1_Score = NA
+)
+
+for (k in seq_along(epsilon_values)) {
+  eps <- epsilon_values[k]
+  preds <- factor(ifelse(log_diff > eps, "pos", "neg"), levels = c("neg", "pos"))
+  cm <- table(Predicted = preds, Actual = y_test)
+  mets <- calculate_metrics(cm)
+  results[k, 2:5] <- mets[c("Accuracy", "Sensitivity", "Specificity", "F1_Score")]
+}
 
 results_long <- results %>%
   select(epsilon, Accuracy, Sensitivity, Specificity, F1_Score) %>%
@@ -574,7 +575,9 @@ p2 <- ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
                        name = "Frecuencia") +
   theme_minimal(base_size = 12) +
   labs(title = sprintf("Matriz de Confusión (Semilla: %d, ε* = %.4f)", OPTIMAL_SEED, epsilon_optimal),
-       subtitle = sprintf("Accuracy = %.2f%% | F1-Score = %.4f", best_Accuracy * 100, best_F1),
+       subtitle = sprintf("Accuracy = %.2f%% | F1-Score = %.4f", 
+                          metrics_optimal["Accuracy"] * 100, metrics_optimal["F1_Score"]),
+       
        x = "Clase Real",
        y = "Clase Predicha") +
   theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
